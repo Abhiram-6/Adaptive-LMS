@@ -4,6 +4,7 @@ const auth     = require('../middleware/auth');
 const User     = require('../models/User');
 const Question = require('../models/Question');
 const Session  = require('../models/Session');
+const { generateQuestion } = require('../llm');
 
 const CATALOGUE = {
   Math:    ['Algebra', 'Geometry', 'Trigonometry', 'Calculus', 'Statistics'],
@@ -36,10 +37,62 @@ router.get('/subject/:subject', auth, async (req, res) => {
   }
 });
 
+// router.get('/question/:subject/:topic', auth, async (req, res) => {
+//   try {
+//     const decodedTopic = decodeURIComponent(req.params.topic);
+//     const sessionId    = req.query.sessionId || null;
+
+//     const user    = await User.findById(req.user.id);
+//     const mastery = user.mastery.find(m => m.topic === decodedTopic);
+//     const p_l     = mastery ? mastery.p_l : 0.3;
+
+//     let difficulty;
+//     if      (p_l < 0.4)  difficulty = 1;
+//     else if (p_l < 0.6)  difficulty = 2;
+//     else if (p_l < 0.75) difficulty = 3;
+//     else                 difficulty = 4;
+
+//     let askedIds = [];
+//     if (sessionId) {
+//       const currentSession = await Session.findById(sessionId);
+//       if (currentSession) {
+//         askedIds = currentSession.responses.map(r => r.questionId).filter(Boolean);
+//       }
+//     }
+
+//     let questions = await Question.find({
+//       topic: decodedTopic,
+//       difficulty,
+//       _id: { $nin: askedIds }
+//     });
+
+//     if (!questions.length) {
+//       questions = await Question.find({ topic: decodedTopic, _id: { $nin: askedIds } });
+//     }
+
+//     if (!questions.length) {
+//       questions = await Question.find({ topic: decodedTopic });
+//     }
+
+//     if (!questions.length) {
+//       return res.status(404).json({ msg: `No questions found for ${decodedTopic}` });
+//     }
+
+//     const q = questions[Math.floor(Math.random() * questions.length)];
+//     res.json({ question: q, current_p_l: p_l });
+
+//   } catch (err) {
+//     console.error('Question route error:', err.message);
+//     res.status(500).json({ msg: err.message });
+//   }
+// });
+
 router.get('/question/:subject/:topic', auth, async (req, res) => {
   try {
-    const decodedTopic = decodeURIComponent(req.params.topic);
-    const sessionId    = req.query.sessionId || null;
+    const { subject, topic } = req.params;
+    const decodedTopic   = decodeURIComponent(topic);
+    const decodedSubject = decodeURIComponent(subject);
+    const sessionId      = req.query.sessionId || null;
 
     const user    = await User.findById(req.user.id);
     const mastery = user.mastery.find(m => m.topic === decodedTopic);
@@ -51,41 +104,98 @@ router.get('/question/:subject/:topic', auth, async (req, res) => {
     else if (p_l < 0.75) difficulty = 3;
     else                 difficulty = 4;
 
-    let askedIds = [];
+    // Get session stats
+    let askedIds     = [];
+    let askedTexts   = [];
+    let sessionCount = 0;
+    let wrongAreas   = [];
+    let correctCount = 0;
+
     if (sessionId) {
       const currentSession = await Session.findById(sessionId);
       if (currentSession) {
-        askedIds = currentSession.responses.map(r => r.questionId).filter(Boolean);
+        sessionCount = currentSession.responses.length;
+        askedIds     = currentSession.responses.map(r => r.questionId).filter(Boolean);
+        askedTexts   = currentSession.responses.map(r => r.questionText).filter(Boolean);
+        wrongAreas   = currentSession.responses
+          .filter(r => !r.correct && r.weakArea)
+          .map(r => r.weakArea);
+        correctCount = currentSession.responses.filter(r => r.correct).length;
       }
     }
 
-    let questions = await Question.find({
-      topic: decodedTopic,
-      difficulty,
-      _id: { $nin: askedIds }
+    // ── Phase 1: first 10 → serve from DB ──
+    if (sessionCount < 10) {
+      let questions = await Question.find({
+        topic: decodedTopic,
+        difficulty,
+        _id: { $nin: askedIds }
+      });
+
+      if (!questions.length) {
+        questions = await Question.find({
+          topic: decodedTopic,
+          _id: { $nin: askedIds }
+        });
+      }
+
+      if (questions.length) {
+        const q = questions[Math.floor(Math.random() * questions.length)];
+        return res.json({
+          question:    q,
+          current_p_l: p_l,
+          phase:       'bank',
+          questionNum: sessionCount + 1
+        });
+      }
+    }
+
+    // ── Phase 2: after 10 → Groq AI personalized ──
+    const accuracy   = sessionCount > 0
+      ? Math.round((correctCount / sessionCount) * 100) : 0;
+
+    const uniqueWeak = [...new Set(wrongAreas)].slice(0, 4);
+
+    // Also pull weak areas from past sessions
+    const pastSessions = await Session.find({ userId: req.user.id, topic: decodedTopic })
+      .sort({ createdAt: -1 }).limit(2);
+    pastSessions.forEach(s => {
+      s.responses.forEach(r => {
+        if (!r.correct && r.weakArea) uniqueWeak.push(r.weakArea);
+      });
     });
+    const finalWeak = [...new Set(uniqueWeak)].slice(0, 4);
 
-    if (!questions.length) {
-      questions = await Question.find({ topic: decodedTopic, _id: { $nin: askedIds } });
-    }
+    // Adjust difficulty based on accuracy
+    let aiDifficulty = difficulty;
+    if      (accuracy >= 80) aiDifficulty = Math.min(difficulty + 1, 4);
+    else if (accuracy <= 40) aiDifficulty = Math.max(difficulty - 1, 1);
 
-    if (!questions.length) {
-      questions = await Question.find({ topic: decodedTopic });
-    }
+    console.log(`🤖 Phase 2 — Q${sessionCount + 1} | Accuracy: ${accuracy}% | Weak: [${finalWeak.join(', ') || 'none'}] | Difficulty: ${aiDifficulty}`);
 
-    if (!questions.length) {
-      return res.status(404).json({ msg: `No questions found for ${decodedTopic}` });
-    }
+    const question = await generateQuestion(
+      decodedTopic,
+      decodedSubject,
+      finalWeak,
+      aiDifficulty,
+      askedTexts
+    );
+    question._id = Date.now().toString();
 
-    const q = questions[Math.floor(Math.random() * questions.length)];
-    res.json({ question: q, current_p_l: p_l });
+    res.json({
+      question,
+      current_p_l: p_l,
+      phase:       'ai',
+      questionNum: sessionCount + 1,
+      accuracy,
+      aiDifficulty
+    });
 
   } catch (err) {
     console.error('Question route error:', err.message);
     res.status(500).json({ msg: err.message });
   }
 });
-
 router.post('/answer', auth, async (req, res) => {
   try {
     const { selectedAnswer, topic, subject, sessionId, question } = req.body;
@@ -126,16 +236,20 @@ router.post('/answer', auth, async (req, res) => {
     await user.save();
 
     if (sessionId) {
-      await Session.findByIdAndUpdate(sessionId, {
-        $push: { responses: {
-          questionId:   question._id,
-          questionText: question.text,
-          correct,
-          p_l_after:    bktData.p_l,
-          weakArea:     !correct ? topic : null
-        }}
-      });
-    }
+  // AI questions have string IDs, DB questions have ObjectIds
+  // Only store questionId if it looks like a valid MongoDB ObjectId
+  const isObjectId = question._id && question._id.length === 24 && /^[a-f0-9]+$/i.test(question._id);
+
+  await Session.findByIdAndUpdate(sessionId, {
+    $push: { responses: {
+      ...(isObjectId && { questionId: question._id }),
+      questionText: question.text,
+      correct,
+      p_l_after:    bktData.p_l,
+      weakArea:     !correct ? topic : null
+    }}
+  });
+}
 
     res.json({
       correct,
